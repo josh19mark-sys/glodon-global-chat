@@ -1,499 +1,1022 @@
+// ========================================================
+// GLODON HUB | GLOBAL CHAT SERVER
+// ========================================================
+
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "64kb" }));
 
-const PORT = process.env.PORT || 3000;
+// ========================================================
+// CONFIG
+// ========================================================
+
+const PORT = process.env.PORT || 10000;
 
 const OWNER_USERNAME = "ueu9195";
 
-const MAX_MESSAGES = 150;
-const PRESENCE_TIMEOUT = 18000;
-const MAX_COLOR_CHANGES = 2;
+// ========================================================
+// DISCORD IMAGE
+// ========================================================
+// Pon aquí el ID NUMÉRICO de la imagen de Roblox que quieres
+// mostrar al lado de [ Discord server ].
+//
+// Ejemplo:
+// const DISCORD_IMAGE_ID = "1234567890";
+//
+// Si lo dejas vacío, no aparecerá imagen.
 
-const BLOCKED_TAGS = new Set([
-  "admin",
-  "creator",
-  "67",
-  "xd",
-  "haa",
-  "verificado",
-  "desarrollador",
-  "mod",
-  "moderador"
-]);
+const DISCORD_IMAGE_ID = "";
+
+// ========================================================
+// LIMITES
+// ========================================================
+
+const MAX_MESSAGES = 150;
+
+const PRESENCE_TIMEOUT = 18 * 1000;
+
+// Cada 7 minutos se eliminan 2 mensajes antiguos.
+const MESSAGE_CLEAN_INTERVAL = 7 * 60 * 1000;
+
+// ========================================================
+// DATA
+// ========================================================
 
 const users = new Map();
-const messages = [];
+
 const profiles = new Map();
 
-function now() {
-  return Date.now();
-}
+const messages = [];
 
-function cleanText(value, maxLength) {
-  if (typeof value !== "string") return "";
+// ========================================================
+// BLOCKED TAGS
+// ========================================================
 
-  return value
-    .replace(/[\u0000-\u001F\u007F]/g, "")
-    .trim()
-    .slice(0, maxLength);
+const BLOCKED_TAGS = new Set([
+    "admin",
+    "creator",
+    "67",
+    "xd",
+    "haa",
+    "verificado",
+    "desarrollador",
+    "mod",
+    "moderador"
+]);
+
+// ========================================================
+// HELPERS
+// ========================================================
+
+function cleanText(value, maxLength = 500) {
+
+    if (typeof value !== "string") {
+        return "";
+    }
+
+    return value
+        .replace(/[\u0000-\u001F\u007F]/g, "")
+        .trim()
+        .slice(0, maxLength);
 }
 
 function cleanUsername(value) {
-  return cleanText(value, 32) || "Usuario";
+
+    return cleanText(value, 30)
+        .replace(/[^\w.-]/g, "");
 }
 
 function validUserId(value) {
-  if (typeof value !== "string") return false;
 
-  return (
-    value.length >= 1 &&
-    value.length <= 80 &&
-    /^[a-zA-Z0-9_.:-]+$/.test(value)
-  );
+    if (
+        value === undefined ||
+        value === null
+    ) {
+        return false;
+    }
+
+    return /^[0-9]{1,30}$/.test(
+        String(value)
+    );
 }
 
 function validColor(value) {
-  if (typeof value !== "string") return false;
 
-  return /^#[0-9A-Fa-f]{6}$/.test(value);
+    if (typeof value !== "string") {
+        return false;
+    }
+
+    return /^#[0-9A-Fa-f]{6}$/.test(value);
 }
 
 function validSticker(value) {
-  if (value === null || value === undefined || value === "") {
-    return "";
-  }
 
-  if (typeof value !== "string") return "";
+    if (
+        value === undefined ||
+        value === null ||
+        value === ""
+    ) {
+        return true;
+    }
 
-  // Acepta:
-  // rbxassetid://123456
-  // https://www.roblox.com/asset/?id=123456
-  // https://create.roblox.com/asset/?id=123456
-  if (
-    /^rbxassetid:\/\/\d+$/.test(value) ||
-    /^https:\/\/www\.roblox\.com\/asset\/\?id=\d+$/.test(value) ||
-    /^https:\/\/create\.roblox\.com\/asset\/\?id=\d+$/.test(value)
-  ) {
-    return value;
-  }
-
-  return "";
+    return /^[0-9]{3,20}$/.test(
+        String(value)
+    );
 }
 
-function isBlockedTag(tag) {
-  if (!tag) return false;
+function normalizeTag(value) {
 
-  return BLOCKED_TAGS.has(tag.toLowerCase());
+    return cleanText(value, 30);
+}
+
+function isBlockedTag(value) {
+
+    if (!value) {
+        return false;
+    }
+
+    return BLOCKED_TAGS.has(
+        String(value).toLowerCase()
+    );
 }
 
 function removeOldPresence() {
-  const limit = now() - PRESENCE_TIMEOUT;
 
-  for (const [userId, user] of users.entries()) {
-    if (user.lastSeen < limit) {
-      users.delete(userId);
+    const now = Date.now();
+
+    for (
+        const [userId, user] of users.entries()
+    ) {
+
+        if (
+            now - user.lastSeen
+            >
+            PRESENCE_TIMEOUT
+        ) {
+
+            users.delete(userId);
+
+        }
+
     }
-  }
+
 }
 
-function isConnected(userId) {
-  removeOldPresence();
+function isOwner(username) {
 
-  const user = users.get(userId);
+    return (
+        String(username || "").toLowerCase()
+        ===
+        OWNER_USERNAME.toLowerCase()
+    );
 
-  if (!user) return false;
-
-  return now() - user.lastSeen <= PRESENCE_TIMEOUT;
 }
 
 function publicProfile(userId, username) {
-  const existing = profiles.get(userId);
 
-  const safeUsername = cleanUsername(username);
+    const profile =
+        profiles.get(String(userId))
+        ||
+        {
+            color: "#FFFFFF",
+            tag: ""
+        };
 
-  if (!existing) {
+    const owner =
+        isOwner(username);
+
     return {
-      userId,
-      username: safeUsername,
-      tag: "",
-      color: "#FFFFFF",
-      colorChanges: 0,
-      verified: safeUsername.toLowerCase() === OWNER_USERNAME.toLowerCase()
-    };
-  }
 
-  return {
-    userId,
-    username: existing.username,
-    tag: existing.tag,
-    color: existing.color,
-    colorChanges: existing.colorChanges,
-    verified: existing.verified
-  };
+        userId: String(userId),
+
+        username:
+            cleanUsername(username),
+
+        color:
+            validColor(profile.color)
+                ? profile.color
+                : "#FFFFFF",
+
+        tag:
+            owner
+                ? ""
+                : (
+                    isBlockedTag(profile.tag)
+                        ? ""
+                        : profile.tag
+                ),
+
+        verified: owner,
+
+        discordImage:
+            DISCORD_IMAGE_ID
+
+    };
+
 }
 
-/* =========================
-   HOME / HEALTH
-========================= */
+function sanitizeReply(reply) {
+
+    if (
+        !reply ||
+        typeof reply !== "object"
+    ) {
+        return null;
+    }
+
+    const id =
+        cleanText(
+            String(reply.id || ""),
+            80
+        );
+
+    if (!id) {
+        return null;
+    }
+
+    return {
+
+        id: id,
+
+        username:
+            cleanUsername(
+                reply.username || "Usuario"
+            ),
+
+        message:
+            cleanText(
+                reply.message || "",
+                180
+            ),
+
+        sticker:
+            validSticker(reply.sticker)
+                ? String(reply.sticker || "")
+                : ""
+
+    };
+
+}
+
+function createMessageId() {
+
+    try {
+
+        return crypto.randomUUID();
+
+    } catch {
+
+        return (
+            Date.now().toString(36)
+            +
+            Math.random()
+                .toString(36)
+                .slice(2)
+        );
+
+    }
+
+}
+
+// ========================================================
+// ROUTES
+// ========================================================
 
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "Glodon Hub Global Chat",
-    status: "online",
-    version: "2.0.0"
-  });
+
+    res.json({
+
+        ok: true,
+
+        name:
+            "Glodon Hub Global Chat",
+
+        status:
+            "online",
+
+        discordImage:
+            DISCORD_IMAGE_ID
+
+    });
+
 });
+
+// ========================================================
+// HEALTH
+// ========================================================
 
 app.get("/health", (req, res) => {
-  removeOldPresence();
 
-  res.json({
-    ok: true,
-    status: "online",
-    users: users.size,
-    messages: messages.length,
-    timestamp: now()
-  });
+    res.json({
+
+        ok: true,
+
+        server: "Glodon Hub",
+
+        uptime:
+            Math.floor(process.uptime()),
+
+        messages:
+            messages.length,
+
+        users:
+            users.size,
+
+        discordImage:
+            DISCORD_IMAGE_ID
+
+    });
+
 });
 
-/* =========================
-   PRESENCE
-========================= */
+// ========================================================
+// PRESENCE
+// ========================================================
 
 app.get("/presence", (req, res) => {
-  removeOldPresence();
 
-  res.json({
-    ok: true,
-    online: users.size,
-    timestamp: now()
-  });
+    removeOldPresence();
+
+    res.json({
+
+        ok: true,
+
+        online:
+            users.size,
+
+        discordImage:
+            DISCORD_IMAGE_ID
+
+    });
+
 });
+
+// ========================================================
+// HEARTBEAT
+// ========================================================
 
 app.post("/heartbeat", (req, res) => {
-  const userId = cleanText(req.body?.userId, 80);
-  const username = cleanUsername(req.body?.username);
 
-  if (!validUserId(userId)) {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid userId"
+    removeOldPresence();
+
+    const userId =
+        String(req.body?.userId || "");
+
+    const username =
+        cleanUsername(
+            req.body?.username || ""
+        );
+
+    if (!validUserId(userId)) {
+
+        return res.status(400).json({
+
+            ok: false,
+
+            error:
+                "Invalid userId"
+
+        });
+
+    }
+
+    if (!username) {
+
+        return res.status(400).json({
+
+            ok: false,
+
+            error:
+                "Invalid username"
+
+        });
+
+    }
+
+    users.set(
+        userId,
+        {
+
+            userId:
+
+                userId,
+
+            username:
+
+                username,
+
+            lastSeen:
+
+                Date.now()
+
+        }
+    );
+
+    res.json({
+
+        ok: true,
+
+        online:
+            users.size,
+
+        discordImage:
+            DISCORD_IMAGE_ID
+
     });
-  }
 
-  users.set(userId, {
-    userId,
-    username,
-    lastSeen: now()
-  });
-
-  // Crear perfil automáticamente
-  if (!profiles.has(userId)) {
-    profiles.set(userId, {
-      userId,
-      username,
-      tag: "",
-      color: "#FFFFFF",
-      colorChanges: 0,
-      verified:
-        username.toLowerCase() === OWNER_USERNAME.toLowerCase()
-    });
-  } else {
-    const profile = profiles.get(userId);
-
-    profile.username = username;
-
-    // La verificación del propietario se mantiene basada
-    // en el nombre recibido.
-    profile.verified =
-      username.toLowerCase() === OWNER_USERNAME.toLowerCase();
-  }
-
-  res.json({
-    ok: true,
-    online: users.size,
-    profile: publicProfile(userId, username)
-  });
 });
+
+// ========================================================
+// LEAVE
+// ========================================================
 
 app.post("/leave", (req, res) => {
-  const userId = cleanText(req.body?.userId, 80);
 
-  if (userId) {
-    users.delete(userId);
-  }
+    const userId =
+        String(req.body?.userId || "");
 
-  res.json({
-    ok: true,
-    online: users.size
-  });
-});
+    if (validUserId(userId)) {
 
-/* =========================
-   PROFILES
-========================= */
+        users.delete(userId);
 
-app.get("/profile/:userId", (req, res) => {
-  const userId = cleanText(req.params.userId, 80);
+    }
 
-  if (!validUserId(userId)) {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid userId"
+    res.json({
+
+        ok: true
+
     });
-  }
 
-  const user = users.get(userId);
-
-  const username =
-    user?.username ||
-    profiles.get(userId)?.username ||
-    "Usuario";
-
-  res.json({
-    ok: true,
-    profile: publicProfile(userId, username)
-  });
 });
+
+// ========================================================
+// PROFILE GET
+// ========================================================
+
+app.get(
+    "/profile/:userId",
+    (req, res) => {
+
+        const userId =
+            String(
+                req.params.userId || ""
+            );
+
+        if (!validUserId(userId)) {
+
+            return res.status(400).json({
+
+                ok: false,
+
+                error:
+                    "Invalid userId"
+
+            });
+
+        }
+
+        let username = "Usuario";
+
+        const onlineUser =
+            users.get(userId);
+
+        if (onlineUser) {
+
+            username =
+                onlineUser.username;
+
+        }
+
+        res.json({
+
+            ok: true,
+
+            profile:
+                publicProfile(
+                    userId,
+                    username
+                )
+
+        });
+
+    }
+);
+
+// ========================================================
+// PROFILE POST
+// ========================================================
 
 app.post("/profile", (req, res) => {
-  const userId = cleanText(req.body?.userId, 80);
-  const username = cleanUsername(req.body?.username);
 
-  if (!validUserId(userId)) {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid userId"
-    });
-  }
+    const userId =
+        String(req.body?.userId || "");
 
-  if (!isConnected(userId)) {
-    return res.status(403).json({
-      ok: false,
-      error: "Not connected"
-    });
-  }
+    const username =
+        cleanUsername(
+            req.body?.username || ""
+        );
 
-  let profile = profiles.get(userId);
+    if (!validUserId(userId)) {
 
-  if (!profile) {
-    profile = {
-      userId,
-      username,
-      tag: "",
-      color: "#FFFFFF",
-      colorChanges: 0,
-      verified:
-        username.toLowerCase() === OWNER_USERNAME.toLowerCase()
-    };
-
-    profiles.set(userId, profile);
-  }
-
-  profile.username = username;
-
-  const isOwner =
-    username.toLowerCase() === OWNER_USERNAME.toLowerCase();
-
-  profile.verified = isOwner;
-
-  /* ---------- TAG ---------- */
-
-  if (Object.prototype.hasOwnProperty.call(req.body, "tag")) {
-    const requestedTag = cleanText(req.body.tag, 24);
-
-    // El propietario puede usar su tag personalizado.
-    if (isOwner) {
-      profile.tag = requestedTag;
-    } else {
-      // Usuarios normales no pueden usar tags bloqueados.
-      if (isBlockedTag(requestedTag)) {
         return res.status(400).json({
-          ok: false,
-          error: "Blocked tag"
+
+            ok: false,
+
+            error:
+                "Invalid userId"
+
         });
-      }
 
-      profile.tag = requestedTag;
-    }
-  }
-
-  /* ---------- COLOR ---------- */
-
-  if (Object.prototype.hasOwnProperty.call(req.body, "color")) {
-    const requestedColor = req.body.color;
-
-    if (!validColor(requestedColor)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid color"
-      });
     }
 
-    if (requestedColor !== profile.color) {
-      if (profile.colorChanges >= MAX_COLOR_CHANGES) {
-        return res.status(403).json({
-          ok: false,
-          error: "Color change limit reached",
-          limit: MAX_COLOR_CHANGES
+    if (!username) {
+
+        return res.status(400).json({
+
+            ok: false,
+
+            error:
+                "Invalid username"
+
         });
-      }
 
-      profile.color = requestedColor;
-      profile.colorChanges++;
     }
-  }
 
-  profiles.set(userId, profile);
+    let profile =
+        profiles.get(userId);
 
-  res.json({
-    ok: true,
-    profile: publicProfile(userId, username)
-  });
+    if (!profile) {
+
+        profile = {
+
+            color: "#FFFFFF",
+
+            tag: "",
+
+            colorChanges: 0
+
+        };
+
+        profiles.set(
+            userId,
+            profile
+        );
+
+    }
+
+    // ----------------------------------------------------
+    // COLOR
+    // ----------------------------------------------------
+
+    if (
+        req.body.color !== undefined
+    ) {
+
+        const color =
+            String(
+                req.body.color || ""
+            );
+
+        if (!validColor(color)) {
+
+            return res.status(400).json({
+
+                ok: false,
+
+                error:
+                    "Invalid color"
+
+            });
+
+        }
+
+        if (
+            color !== profile.color
+            &&
+            profile.colorChanges >= 2
+        ) {
+
+            return res.status(400).json({
+
+                ok: false,
+
+                error:
+                    "Color change limit reached"
+
+            });
+
+        }
+
+        if (
+            color !== profile.color
+        ) {
+
+            profile.colorChanges += 1;
+
+        }
+
+        profile.color =
+            color;
+
+    }
+
+    // ----------------------------------------------------
+    // TAG
+    // ----------------------------------------------------
+
+    if (
+        req.body.tag !== undefined
+    ) {
+
+        const tag =
+            normalizeTag(
+                req.body.tag
+            );
+
+        // Owner no puede cambiar su etiqueta.
+        if (isOwner(username)) {
+
+            profile.tag = "";
+
+        } else {
+
+            if (
+                isBlockedTag(tag)
+            ) {
+
+                profile.tag = "";
+
+            } else {
+
+                profile.tag = tag;
+
+            }
+
+        }
+
+    }
+
+    profiles.set(
+        userId,
+        profile
+    );
+
+    res.json({
+
+        ok: true,
+
+        profile:
+            publicProfile(
+                userId,
+                username
+            ),
+
+        colorChanges:
+            profile.colorChanges,
+
+        colorChangesRemaining:
+            Math.max(
+                0,
+                2 - profile.colorChanges
+            )
+
+    });
+
 });
 
-/* =========================
-   MESSAGES
-========================= */
+// ========================================================
+// GET MESSAGES
+// ========================================================
 
 app.get("/messages", (req, res) => {
-  const requestedLimit = Number.parseInt(req.query.limit, 10);
 
-  const limit =
-    Number.isFinite(requestedLimit) && requestedLimit > 0
-      ? Math.min(requestedLimit, 50)
-      : 50;
+    const limit =
+        Math.min(
+            50,
+            Math.max(
+                1,
+                Number(
+                    req.query.limit
+                )
+                ||
+                50
+            )
+        );
 
-  const result = messages.slice(-limit);
+    const result =
+        messages.slice(
+            Math.max(
+                0,
+                messages.length - limit
+            )
+        );
 
-  res.json({
-    ok: true,
-    messages: result
-  });
+    res.json({
+
+        ok: true,
+
+        messages:
+            result,
+
+        discordImage:
+            DISCORD_IMAGE_ID
+
+    });
+
 });
+
+// ========================================================
+// POST MESSAGE
+// ========================================================
 
 app.post("/messages", (req, res) => {
-  const userId = cleanText(req.body?.userId, 80);
-  const username = cleanUsername(req.body?.username);
 
-  if (!validUserId(userId)) {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid userId"
-    });
-  }
+    removeOldPresence();
 
-  if (!isConnected(userId)) {
-    return res.status(403).json({
-      ok: false,
-      error: "Not connected"
-    });
-  }
+    const userId =
+        String(req.body?.userId || "");
 
-  const messageText = cleanText(req.body?.message, 500);
-  const sticker = validSticker(req.body?.sticker);
+    const username =
+        cleanUsername(
+            req.body?.username || ""
+        );
 
-  if (!messageText && !sticker) {
-    return res.status(400).json({
-      ok: false,
-      error: "Empty message"
-    });
-  }
+    const message =
+        cleanText(
+            req.body?.message || "",
+            500
+        );
 
-  let profile = profiles.get(userId);
+    const sticker =
+        req.body?.sticker
+            ? String(
+                req.body.sticker
+            )
+            : "";
 
-  if (!profile) {
-    profile = {
-      userId,
-      username,
-      tag: "",
-      color: "#FFFFFF",
-      colorChanges: 0,
-      verified:
-        username.toLowerCase() === OWNER_USERNAME.toLowerCase()
+    // ----------------------------------------------------
+    // CHECK USER
+    // ----------------------------------------------------
+
+    if (!validUserId(userId)) {
+
+        return res.status(400).json({
+
+            ok: false,
+
+            error:
+                "Invalid userId"
+
+        });
+
+    }
+
+    if (!username) {
+
+        return res.status(400).json({
+
+            ok: false,
+
+            error:
+                "Invalid username"
+
+        });
+
+    }
+
+    const onlineUser =
+        users.get(userId);
+
+    if (!onlineUser) {
+
+        return res.status(403).json({
+
+            ok: false,
+
+            error:
+                "User is not connected"
+
+        });
+
+    }
+
+    // ----------------------------------------------------
+    // CHECK STICKER
+    // ----------------------------------------------------
+
+    if (!validSticker(sticker)) {
+
+        return res.status(400).json({
+
+            ok: false,
+
+            error:
+                "Invalid sticker"
+
+        });
+
+    }
+
+    if (
+        !message &&
+        !sticker
+    ) {
+
+        return res.status(400).json({
+
+            ok: false,
+
+            error:
+                "Empty message"
+
+        });
+
+    }
+
+    // ----------------------------------------------------
+    // PROFILE
+    // ----------------------------------------------------
+
+    const profile =
+        profiles.get(userId)
+        ||
+        {
+            color: "#FFFFFF",
+            tag: "",
+            colorChanges: 0
+        };
+
+    // ----------------------------------------------------
+    // REPLY
+    // ----------------------------------------------------
+
+    const replyTo =
+        sanitizeReply(
+            req.body?.replyTo
+        );
+
+    // ----------------------------------------------------
+    // MESSAGE
+    // ----------------------------------------------------
+
+    const newMessage = {
+
+        id:
+            createMessageId(),
+
+        userId:
+            userId,
+
+        username:
+            username,
+
+        tag:
+            isOwner(username)
+                ? ""
+                : (
+                    isBlockedTag(
+                        profile.tag
+                    )
+                        ? ""
+                        : profile.tag
+                ),
+
+        color:
+            validColor(profile.color)
+                ? profile.color
+                : "#FFFFFF",
+
+        verified:
+            isOwner(username),
+
+        message:
+            message,
+
+        sticker:
+            sticker,
+
+        replyTo:
+            replyTo,
+
+        discordImage:
+            DISCORD_IMAGE_ID,
+
+        timestamp:
+            Date.now()
+
     };
 
-    profiles.set(userId, profile);
-  }
+    messages.push(
+        newMessage
+    );
 
-  profile.username = username;
+    // Seguridad adicional de memoria.
+    while (
+        messages.length >
+        MAX_MESSAGES
+    ) {
 
-  const isOwner =
-    username.toLowerCase() === OWNER_USERNAME.toLowerCase();
+        messages.shift();
 
-  profile.verified = isOwner;
+    }
 
-  const message = {
-    id:
-      `${Date.now()}-` +
-      Math.random().toString(36).slice(2, 10),
+    res.json({
 
-    userId,
+        ok: true,
 
-    username: profile.username,
+        message:
+            newMessage
 
-    tag: profile.tag,
+    });
 
-    color: profile.color,
-
-    verified: profile.verified,
-
-    message: messageText,
-
-    sticker,
-
-    timestamp: now()
-  };
-
-  messages.push(message);
-
-  // Máximo 150 mensajes en memoria.
-  while (messages.length > MAX_MESSAGES) {
-    messages.shift();
-  }
-
-  res.json({
-    ok: true,
-    message
-  });
 });
 
-/* =========================
-   404
-========================= */
+// ========================================================
+// AUTO CLEAN
+// ========================================================
+// Cada 7 minutos elimina exactamente 2 mensajes antiguos.
+// Si hay menos de 2, elimina los que existan.
 
-app.use((req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: "Route not found"
-  });
-});
+setInterval(() => {
 
-/* =========================
-   ERROR HANDLER
-========================= */
+    const amount =
+        Math.min(
+            2,
+            messages.length
+        );
 
-app.use((err, req, res, next) => {
-  console.error(err);
+    for (
+        let i = 0;
+        i < amount;
+        i++
+    ) {
 
-  res.status(500).json({
-    ok: false,
-    error: "Internal server error"
-  });
-});
+        messages.shift();
 
-/* =========================
-   START
-========================= */
+    }
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `Glodon Hub Global Chat running on port ${PORT}`
-  );
-});
+    console.log(
+        "[Glodon] Limpieza automática:",
+        amount,
+        "mensajes eliminados."
+    );
+
+}, MESSAGE_CLEAN_INTERVAL);
+
+// ========================================================
+// PRESENCE CLEAN
+// ========================================================
+
+setInterval(() => {
+
+    removeOldPresence();
+
+}, 5000);
+
+// ========================================================
+// SERVER
+// ========================================================
+
+app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+
+        console.log(
+            "======================================"
+        );
+
+        console.log(
+            "Glodon Hub Global Chat"
+        );
+
+        console.log(
+            "Server online"
+        );
+
+        console.log(
+            "Port:",
+            PORT
+        );
+
+        console.log(
+            "Discord image:",
+            DISCORD_IMAGE_ID || "OFF"
+        );
+
+        console.log(
+            "Auto clean: 2 messages / 7 minutes"
+        );
+
+        console.log(
+            "======================================"
+
+        );
+
+    }
+);
