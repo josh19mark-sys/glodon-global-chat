@@ -1,61 +1,51 @@
-// ========================================================
-// GLODON HUB | GLOBAL CHAT SERVER
-// ========================================================
+//============================================================
+// GLODON HUB | GLOBAL CHAT
+// SERVER.JS
+//============================================================
 
 const express = require("express");
 const cors = require("cors");
-const crypto = require("crypto");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "64kb" }));
 
-// ========================================================
+//============================================================
 // CONFIG
-// ========================================================
+//============================================================
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 
 const OWNER_USERNAME = "ueu9195";
 
-// ========================================================
-// DISCORD IMAGE
-// ========================================================
-// Pon aquí el ID NUMÉRICO de la imagen de Roblox que quieres
-// mostrar al lado de [ Discord server ].
-//
-// Ejemplo:
-// const DISCORD_IMAGE_ID = "1234567890";
-//
-// Si lo dejas vacío, no aparecerá imagen.
-
-const DISCORD_IMAGE_ID = "";
-
-// ========================================================
-// LIMITES
-// ========================================================
-
 const MAX_MESSAGES = 150;
 
-const PRESENCE_TIMEOUT = 18 * 1000;
+const PRESENCE_TIMEOUT = 18000;
 
-// Cada 7 minutos se eliminan 2 mensajes antiguos.
-const MESSAGE_CLEAN_INTERVAL = 7 * 60 * 1000;
+// Cada 7 minutos
+const AUTO_DELETE_INTERVAL = 7 * 60 * 1000;
 
-// ========================================================
-// DATA
-// ========================================================
+// Borrar 2 mensajes
+const AUTO_DELETE_COUNT = 2;
+
+//============================================================
+// MEMORY
+//============================================================
 
 const users = new Map();
-
+const messages = [];
 const profiles = new Map();
 
-const messages = [];
+// IDs eliminados recientemente.
+// El cliente puede usarlos para quitar mensajes de su GUI.
+const recentlyDeleted = [];
 
-// ========================================================
+let messageSequence = 0;
+
+//============================================================
 // BLOCKED TAGS
-// ========================================================
+//============================================================
 
 const BLOCKED_TAGS = new Set([
     "admin",
@@ -69,41 +59,54 @@ const BLOCKED_TAGS = new Set([
     "moderador"
 ]);
 
-// ========================================================
+//============================================================
 // HELPERS
-// ========================================================
+//============================================================
 
-function cleanText(value, maxLength = 500) {
+function cleanText(value, maxLength) {
 
     if (typeof value !== "string") {
         return "";
     }
 
     return value
-        .replace(/[\u0000-\u001F\u007F]/g, "")
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
         .trim()
         .slice(0, maxLength);
 }
 
+//============================================================
+
 function cleanUsername(value) {
 
-    return cleanText(value, 30)
-        .replace(/[^\w.-]/g, "");
+    return cleanText(value, 32)
+        .replace(/[<>]/g, "");
 }
+
+//============================================================
 
 function validUserId(value) {
 
     if (
-        value === undefined ||
-        value === null
+        typeof value !== "string" &&
+        typeof value !== "number"
     ) {
         return false;
     }
 
-    return /^[0-9]{1,30}$/.test(
-        String(value)
-    );
+    const id = String(value);
+
+    return /^\d+$/.test(id) && id.length <= 20;
 }
+
+//============================================================
+
+function normalizeUserId(value) {
+
+    return String(value);
+}
+
+//============================================================
 
 function validColor(value) {
 
@@ -114,360 +117,466 @@ function validColor(value) {
     return /^#[0-9A-Fa-f]{6}$/.test(value);
 }
 
+//============================================================
+
+function isBlockedTag(tag) {
+
+    if (!tag) {
+        return false;
+    }
+
+    return BLOCKED_TAGS.has(
+        String(tag).trim().toLowerCase()
+    );
+}
+
+//============================================================
+// DISCORD ICON
+//============================================================
+
+function normalizeDiscordIcon(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return "";
+    }
+
+    let valueString = String(value).trim();
+
+    // Si mandan solamente:
+    // 16584754901
+    //
+    // usamos una miniatura de Roblox.
+    if (/^\d+$/.test(valueString)) {
+
+        return (
+            "rbxthumb://type=Asset&id=" +
+            valueString +
+            "&w=150&h=150"
+        );
+    }
+
+    // Si ya mandan rbxassetid
+    if (
+        /^rbxassetid:\/\/\d+$/.test(
+            valueString
+        )
+    ) {
+
+        const id =
+            valueString
+                .replace(
+                    "rbxassetid://",
+                    ""
+                );
+
+        return (
+            "rbxthumb://type=Asset&id=" +
+            id +
+            "&w=150&h=150"
+        );
+    }
+
+    // Si ya es rbxthumb
+    if (
+        valueString.startsWith(
+            "rbxthumb://"
+        )
+    ) {
+
+        return valueString.slice(0, 300);
+    }
+
+    return "";
+}
+
+//============================================================
+// STICKER
+//============================================================
+
 function validSticker(value) {
 
     if (
-        value === undefined ||
         value === null ||
+        value === undefined ||
         value === ""
     ) {
         return true;
     }
 
-    return /^[0-9]{3,20}$/.test(
-        String(value)
+    const sticker = String(value);
+
+    return (
+        /^rbxassetid:\/\/\d+$/.test(sticker)
+        ||
+        /^rbxthumb:\/\/type=Asset&id=\d+&w=\d+&h=\d+$/.test(sticker)
     );
 }
 
-function normalizeTag(value) {
+//============================================================
+// PROFILE
+//============================================================
 
-    return cleanText(value, 30);
+function getDefaultProfile(username) {
+
+    const isOwner =
+        String(username).toLowerCase() ===
+        OWNER_USERNAME.toLowerCase();
+
+    return {
+
+        tag: "",
+
+        color: "#9641FF",
+
+        colorChanges: 0,
+
+        discordIcon: "",
+
+        verified: isOwner
+    };
 }
 
-function isBlockedTag(value) {
+//============================================================
 
-    if (!value) {
-        return false;
+function getProfile(userId, username) {
+
+    let profile = profiles.get(userId);
+
+    if (!profile) {
+
+        profile =
+            getDefaultProfile(username);
+
+        profiles.set(
+            userId,
+            profile
+        );
     }
 
-    return BLOCKED_TAGS.has(
-        String(value).toLowerCase()
-    );
+    // Owner verification se recalcula
+    // según el username guardado.
+    profile.verified =
+        String(username).toLowerCase() ===
+        OWNER_USERNAME.toLowerCase();
+
+    return profile;
 }
+
+//============================================================
+// PUBLIC PROFILE
+//============================================================
+
+function publicProfile(userId, username) {
+
+    const profile =
+        getProfile(
+            userId,
+            username
+        );
+
+    const isOwner =
+        String(username).toLowerCase() ===
+        OWNER_USERNAME.toLowerCase();
+
+    return {
+
+        tag:
+            isOwner
+                ? ""
+                : profile.tag,
+
+        color:
+            profile.color,
+
+        colorChanges:
+            profile.colorChanges,
+
+        discordIcon:
+            profile.discordIcon,
+
+        verified:
+            isOwner
+    };
+}
+
+//============================================================
+// PRESENCE CLEANUP
+//============================================================
 
 function removeOldPresence() {
 
     const now = Date.now();
 
     for (
-        const [userId, user] of users.entries()
+        const [
+            userId,
+            user
+        ] of users.entries()
     ) {
 
         if (
-            now - user.lastSeen
-            >
+            now - user.lastSeen >
             PRESENCE_TIMEOUT
         ) {
 
             users.delete(userId);
+        }
+    }
+}
 
+//============================================================
+// DELETE MESSAGE
+//============================================================
+
+function deleteOldMessages(count) {
+
+    if (messages.length <= 0) {
+        return [];
+    }
+
+    const amount =
+        Math.min(
+            count,
+            messages.length
+        );
+
+    const deleted = [];
+
+    for (
+        let i = 0;
+        i < amount;
+        i++
+    ) {
+
+        const old =
+            messages.shift();
+
+        if (old) {
+
+            deleted.push(
+                old.id
+            );
+
+            recentlyDeleted.push(
+                old.id
+            );
+        }
+    }
+
+    // Mantener la lista pequeña.
+    while (
+        recentlyDeleted.length > 100
+    ) {
+
+        recentlyDeleted.shift();
+    }
+
+    return deleted;
+}
+
+//============================================================
+// AUTO DELETE
+//============================================================
+
+setInterval(
+    function() {
+
+        removeOldPresence();
+
+        const deleted =
+            deleteOldMessages(
+                AUTO_DELETE_COUNT
+            );
+
+        if (deleted.length > 0) {
+
+            console.log(
+                "[Glodon Hub] Auto-delete:",
+                deleted.join(", ")
+            );
         }
 
+    },
+    AUTO_DELETE_INTERVAL
+);
+
+//============================================================
+// ROOT
+//============================================================
+
+app.get(
+    "/",
+    function(req, res) {
+
+        res.json({
+
+            ok: true,
+
+            service:
+                "Glodon Hub Global Chat",
+
+            version:
+                "3.0.0",
+
+            status:
+                "online"
+        });
     }
+);
 
-}
-
-function isOwner(username) {
-
-    return (
-        String(username || "").toLowerCase()
-        ===
-        OWNER_USERNAME.toLowerCase()
-    );
-
-}
-
-function publicProfile(userId, username) {
-
-    const profile =
-        profiles.get(String(userId))
-        ||
-        {
-            color: "#FFFFFF",
-            tag: ""
-        };
-
-    const owner =
-        isOwner(username);
-
-    return {
-
-        userId: String(userId),
-
-        username:
-            cleanUsername(username),
-
-        color:
-            validColor(profile.color)
-                ? profile.color
-                : "#FFFFFF",
-
-        tag:
-            owner
-                ? ""
-                : (
-                    isBlockedTag(profile.tag)
-                        ? ""
-                        : profile.tag
-                ),
-
-        verified: owner,
-
-        discordImage:
-            DISCORD_IMAGE_ID
-
-    };
-
-}
-
-function sanitizeReply(reply) {
-
-    if (
-        !reply ||
-        typeof reply !== "object"
-    ) {
-        return null;
-    }
-
-    const id =
-        cleanText(
-            String(reply.id || ""),
-            80
-        );
-
-    if (!id) {
-        return null;
-    }
-
-    return {
-
-        id: id,
-
-        username:
-            cleanUsername(
-                reply.username || "Usuario"
-            ),
-
-        message:
-            cleanText(
-                reply.message || "",
-                180
-            ),
-
-        sticker:
-            validSticker(reply.sticker)
-                ? String(reply.sticker || "")
-                : ""
-
-    };
-
-}
-
-function createMessageId() {
-
-    try {
-
-        return crypto.randomUUID();
-
-    } catch {
-
-        return (
-            Date.now().toString(36)
-            +
-            Math.random()
-                .toString(36)
-                .slice(2)
-        );
-
-    }
-
-}
-
-// ========================================================
-// ROUTES
-// ========================================================
-
-app.get("/", (req, res) => {
-
-    res.json({
-
-        ok: true,
-
-        name:
-            "Glodon Hub Global Chat",
-
-        status:
-            "online",
-
-        discordImage:
-            DISCORD_IMAGE_ID
-
-    });
-
-});
-
-// ========================================================
+//============================================================
 // HEALTH
-// ========================================================
+//============================================================
 
-app.get("/health", (req, res) => {
+app.get(
+    "/health",
+    function(req, res) {
 
-    res.json({
+        res.json({
 
-        ok: true,
+            ok: true,
 
-        server: "Glodon Hub",
+            status: "online",
 
-        uptime:
-            Math.floor(process.uptime()),
+            messages:
+                messages.length,
 
-        messages:
-            messages.length,
+            users:
+                users.size,
 
-        users:
-            users.size,
+            uptime:
+                process.uptime()
+        });
+    }
+);
 
-        discordImage:
-            DISCORD_IMAGE_ID
-
-    });
-
-});
-
-// ========================================================
+//============================================================
 // PRESENCE
-// ========================================================
+//============================================================
 
-app.get("/presence", (req, res) => {
+app.get(
+    "/presence",
+    function(req, res) {
 
-    removeOldPresence();
+        removeOldPresence();
 
-    res.json({
+        res.json({
 
-        ok: true,
+            ok: true,
 
-        online:
-            users.size,
+            online:
+                users.size
+        });
+    }
+);
 
-        discordImage:
-            DISCORD_IMAGE_ID
-
-    });
-
-});
-
-// ========================================================
+//============================================================
 // HEARTBEAT
-// ========================================================
+//============================================================
 
-app.post("/heartbeat", (req, res) => {
+app.post(
+    "/heartbeat",
+    function(req, res) {
 
-    removeOldPresence();
+        const userId =
+            normalizeUserId(
+                req.body?.userId
+            );
 
-    const userId =
-        String(req.body?.userId || "");
+        const username =
+            cleanUsername(
+                req.body?.username
+            );
 
-    const username =
-        cleanUsername(
-            req.body?.username || ""
-        );
+        if (
+            !validUserId(userId)
+            ||
+            !username
+        ) {
 
-    if (!validUserId(userId)) {
+            return res.status(400).json({
 
-        return res.status(400).json({
+                ok: false,
 
-            ok: false,
+                error:
+                    "Invalid user"
+            });
+        }
 
-            error:
-                "Invalid userId"
-
-        });
-
-    }
-
-    if (!username) {
-
-        return res.status(400).json({
-
-            ok: false,
-
-            error:
-                "Invalid username"
-
-        });
-
-    }
-
-    users.set(
-        userId,
-        {
-
-            userId:
+        users.set(
+            userId,
+            {
 
                 userId,
 
-            username:
-
                 username,
 
-            lastSeen:
+                lastSeen:
+                    Date.now()
+            }
+        );
 
-                Date.now()
+        removeOldPresence();
 
-        }
-    );
+        res.json({
 
-    res.json({
+            ok: true,
 
-        ok: true,
-
-        online:
-            users.size,
-
-        discordImage:
-            DISCORD_IMAGE_ID
-
-    });
-
-});
-
-// ========================================================
-// LEAVE
-// ========================================================
-
-app.post("/leave", (req, res) => {
-
-    const userId =
-        String(req.body?.userId || "");
-
-    if (validUserId(userId)) {
-
-        users.delete(userId);
-
+            online:
+                users.size
+        });
     }
+);
 
-    res.json({
+//============================================================
+// LEAVE
+//============================================================
 
-        ok: true
+app.post(
+    "/leave",
+    function(req, res) {
 
-    });
+        const userId =
+            normalizeUserId(
+                req.body?.userId
+            );
 
-});
+        if (
+            validUserId(userId)
+        ) {
 
-// ========================================================
+            users.delete(
+                userId
+            );
+        }
+
+        res.json({
+
+            ok: true
+        });
+    }
+);
+
+//============================================================
 // PROFILE GET
-// ========================================================
+//============================================================
 
 app.get(
     "/profile/:userId",
-    (req, res) => {
+    function(req, res) {
 
         const userId =
-            String(
-                req.params.userId || ""
+            normalizeUserId(
+                req.params.userId
             );
 
-        if (!validUserId(userId)) {
+        if (
+            !validUserId(userId)
+        ) {
 
             return res.status(400).json({
 
@@ -475,22 +584,16 @@ app.get(
 
                 error:
                     "Invalid userId"
-
             });
-
         }
 
-        let username = "Usuario";
-
-        const onlineUser =
+        const user =
             users.get(userId);
 
-        if (onlineUser) {
-
-            username =
-                onlineUser.username;
-
-        }
+        const username =
+            user
+                ? user.username
+                : "Usuario";
 
         res.json({
 
@@ -501,104 +604,32 @@ app.get(
                     userId,
                     username
                 )
-
         });
-
     }
 );
 
-// ========================================================
+//============================================================
 // PROFILE POST
-// ========================================================
+//============================================================
 
-app.post("/profile", (req, res) => {
+app.post(
+    "/profile",
+    function(req, res) {
 
-    const userId =
-        String(req.body?.userId || "");
-
-    const username =
-        cleanUsername(
-            req.body?.username || ""
-        );
-
-    if (!validUserId(userId)) {
-
-        return res.status(400).json({
-
-            ok: false,
-
-            error:
-                "Invalid userId"
-
-        });
-
-    }
-
-    if (!username) {
-
-        return res.status(400).json({
-
-            ok: false,
-
-            error:
-                "Invalid username"
-
-        });
-
-    }
-
-    let profile =
-        profiles.get(userId);
-
-    if (!profile) {
-
-        profile = {
-
-            color: "#FFFFFF",
-
-            tag: "",
-
-            colorChanges: 0
-
-        };
-
-        profiles.set(
-            userId,
-            profile
-        );
-
-    }
-
-    // ----------------------------------------------------
-    // COLOR
-    // ----------------------------------------------------
-
-    if (
-        req.body.color !== undefined
-    ) {
-
-        const color =
-            String(
-                req.body.color || ""
+        const userId =
+            normalizeUserId(
+                req.body?.userId
             );
 
-        if (!validColor(color)) {
-
-            return res.status(400).json({
-
-                ok: false,
-
-                error:
-                    "Invalid color"
-
-            });
-
-        }
+        const username =
+            cleanUsername(
+                req.body?.username
+            );
 
         if (
-            color !== profile.color
-            &&
-            profile.colorChanges >= 2
+            !validUserId(userId)
+            ||
+            !username
         ) {
 
             return res.status(400).json({
@@ -606,417 +637,535 @@ app.post("/profile", (req, res) => {
                 ok: false,
 
                 error:
-                    "Color change limit reached"
-
+                    "Invalid user"
             });
-
         }
 
-        if (
-            color !== profile.color
-        ) {
-
-            profile.colorChanges += 1;
-
-        }
-
-        profile.color =
-            color;
-
-    }
-
-    // ----------------------------------------------------
-    // TAG
-    // ----------------------------------------------------
-
-    if (
-        req.body.tag !== undefined
-    ) {
-
-        const tag =
-            normalizeTag(
-                req.body.tag
+        const profile =
+            getProfile(
+                userId,
+                username
             );
 
-        // Owner no puede cambiar su etiqueta.
-        if (isOwner(username)) {
+        const isOwner =
+            username.toLowerCase() ===
+            OWNER_USERNAME.toLowerCase();
 
-            profile.tag = "";
+        //====================================================
+        // TAG
+        //====================================================
 
-        } else {
+        if (
+            req.body.tag !== undefined
+        ) {
+
+            const tag =
+                cleanText(
+                    req.body.tag,
+                    24
+                );
 
             if (
+                !isOwner
+                &&
                 isBlockedTag(tag)
             ) {
 
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "Blocked tag"
+                });
+            }
+
+            if (isOwner) {
+
+                // Owner no necesita tag personalizado.
                 profile.tag = "";
 
             } else {
 
                 profile.tag = tag;
-
             }
-
         }
 
-    }
+        //====================================================
+        // COLOR
+        //====================================================
 
-    profiles.set(
-        userId,
-        profile
-    );
+        if (
+            req.body.color !== undefined
+        ) {
 
-    res.json({
+            const color =
+                String(
+                    req.body.color
+                );
 
-        ok: true,
+            if (
+                !validColor(color)
+            ) {
 
-        profile:
-            publicProfile(
-                userId,
-                username
-            ),
+                return res.status(400).json({
 
-        colorChanges:
-            profile.colorChanges,
+                    ok: false,
 
-        colorChangesRemaining:
-            Math.max(
-                0,
-                2 - profile.colorChanges
-            )
+                    error:
+                        "Invalid color"
+                });
+            }
 
-    });
+            // El owner también puede tener
+            // color guardado, pero el límite
+            // continúa siendo 2.
+            if (
+                profile.colorChanges >= 2
+            ) {
 
-});
+                return res.status(400).json({
 
-// ========================================================
-// GET MESSAGES
-// ========================================================
+                    ok: false,
 
-app.get("/messages", (req, res) => {
+                    error:
+                        "Color change limit reached"
+                });
+            }
 
-    const limit =
-        Math.min(
-            50,
-            Math.max(
-                1,
-                Number(
-                    req.query.limit
+            profile.color =
+                color.toUpperCase();
+
+            profile.colorChanges += 1;
+        }
+
+        //====================================================
+        // DISCORD ICON
+        //====================================================
+
+        if (
+            req.body.discordIcon !== undefined
+        ) {
+
+            profile.discordIcon =
+                normalizeDiscordIcon(
+                    req.body.discordIcon
+                );
+        }
+
+        //====================================================
+        // VERIFIED
+        //====================================================
+
+        profile.verified =
+            isOwner;
+
+        res.json({
+
+            ok: true,
+
+            profile:
+                publicProfile(
+                    userId,
+                    username
                 )
-                ||
-                50
-            )
-        );
+        });
+    }
+);
 
-    const result =
-        messages.slice(
+//============================================================
+// GET MESSAGES
+//============================================================
+
+app.get(
+    "/messages",
+    function(req, res) {
+
+        const limit =
+            Math.min(
+                Math.max(
+                    parseInt(
+                        req.query.limit
+                    ) || 50,
+                    1
+                ),
+                100
+            );
+
+        removeOldPresence();
+
+        const start =
             Math.max(
                 0,
                 messages.length - limit
-            )
-        );
+            );
 
-    res.json({
+        res.json({
 
-        ok: true,
+            ok: true,
 
-        messages:
-            result,
+            messages:
+                messages.slice(start),
 
-        discordImage:
-            DISCORD_IMAGE_ID
-
-    });
-
-});
-
-// ========================================================
-// POST MESSAGE
-// ========================================================
-
-app.post("/messages", (req, res) => {
-
-    removeOldPresence();
-
-    const userId =
-        String(req.body?.userId || "");
-
-    const username =
-        cleanUsername(
-            req.body?.username || ""
-        );
-
-    const message =
-        cleanText(
-            req.body?.message || "",
-            500
-        );
-
-    const sticker =
-        req.body?.sticker
-            ? String(
-                req.body.sticker
-            )
-            : "";
-
-    // ----------------------------------------------------
-    // CHECK USER
-    // ----------------------------------------------------
-
-    if (!validUserId(userId)) {
-
-        return res.status(400).json({
-
-            ok: false,
-
-            error:
-                "Invalid userId"
-
+            deletedIds:
+                recentlyDeleted.slice()
         });
-
     }
+);
 
-    if (!username) {
+//============================================================
+// MESSAGE ID
+//============================================================
 
-        return res.status(400).json({
+function createMessageId() {
 
-            ok: false,
+    messageSequence += 1;
 
-            error:
-                "Invalid username"
+    return (
+        Date.now().toString(36)
+        +
+        "-"
+        +
+        messageSequence.toString(36)
+    );
+}
 
-        });
+//============================================================
+// REPLY DATA
+//============================================================
 
-    }
-
-    const onlineUser =
-        users.get(userId);
-
-    if (!onlineUser) {
-
-        return res.status(403).json({
-
-            ok: false,
-
-            error:
-                "User is not connected"
-
-        });
-
-    }
-
-    // ----------------------------------------------------
-    // CHECK STICKER
-    // ----------------------------------------------------
-
-    if (!validSticker(sticker)) {
-
-        return res.status(400).json({
-
-            ok: false,
-
-            error:
-                "Invalid sticker"
-
-        });
-
-    }
+function cleanReply(reply) {
 
     if (
-        !message &&
-        !sticker
+        !reply
+        ||
+        typeof reply !== "object"
     ) {
 
-        return res.status(400).json({
-
-            ok: false,
-
-            error:
-                "Empty message"
-
-        });
-
+        return null;
     }
 
-    // ----------------------------------------------------
-    // PROFILE
-    // ----------------------------------------------------
-
-    const profile =
-        profiles.get(userId)
-        ||
-        {
-            color: "#FFFFFF",
-            tag: "",
-            colorChanges: 0
-        };
-
-    // ----------------------------------------------------
-    // REPLY
-    // ----------------------------------------------------
-
-    const replyTo =
-        sanitizeReply(
-            req.body?.replyTo
+    const id =
+        cleanText(
+            reply.id,
+            80
         );
 
-    // ----------------------------------------------------
-    // MESSAGE
-    // ----------------------------------------------------
+    if (!id) {
+        return null;
+    }
 
-    const newMessage = {
+    const original =
+        messages.find(
+            message =>
+                message.id === id
+        );
+
+    if (!original) {
+        return null;
+    }
+
+    return {
 
         id:
-            createMessageId(),
-
-        userId:
-            userId,
+            original.id,
 
         username:
-            username,
-
-        tag:
-            isOwner(username)
-                ? ""
-                : (
-                    isBlockedTag(
-                        profile.tag
-                    )
-                        ? ""
-                        : profile.tag
-                ),
-
-        color:
-            validColor(profile.color)
-                ? profile.color
-                : "#FFFFFF",
-
-        verified:
-            isOwner(username),
+            cleanUsername(
+                original.username
+            ),
 
         message:
-            message,
+            cleanText(
+                original.message,
+                180
+            ),
 
         sticker:
+            validSticker(
+                original.sticker
+            )
+                ? original.sticker
+                : ""
+    };
+}
+
+//============================================================
+// POST MESSAGE
+//============================================================
+
+app.post(
+    "/messages",
+    function(req, res) {
+
+        const userId =
+            normalizeUserId(
+                req.body?.userId
+            );
+
+        const username =
+            cleanUsername(
+                req.body?.username
+            );
+
+        const message =
+            cleanText(
+                req.body?.message,
+                500
+            );
+
+        const sticker =
+            req.body?.sticker
+                ? String(
+                    req.body.sticker
+                ).trim()
+                : "";
+
+        if (
+            !validUserId(userId)
+        ) {
+
+            return res.status(400).json({
+
+                ok: false,
+
+                error:
+                    "Invalid userId"
+            });
+        }
+
+        if (!username) {
+
+            return res.status(400).json({
+
+                ok: false,
+
+                error:
+                    "Invalid username"
+            });
+        }
+
+        //====================================================
+        // MUST BE CONNECTED
+        //====================================================
+
+        removeOldPresence();
+
+        const currentUser =
+            users.get(userId);
+
+        if (
+            !currentUser
+            ||
+            Date.now() -
+                currentUser.lastSeen
+                >
+                PRESENCE_TIMEOUT
+        ) {
+
+            users.delete(userId);
+
+            return res.status(403).json({
+
+                ok: false,
+
+                error:
+                    "Not connected"
+            });
+        }
+
+        //====================================================
+        // STICKER
+        //====================================================
+
+        if (
+            sticker
+            &&
+            !validSticker(sticker)
+        ) {
+
+            return res.status(400).json({
+
+                ok: false,
+
+                error:
+                    "Invalid sticker"
+            });
+        }
+
+        //====================================================
+        // MESSAGE OR STICKER
+        //====================================================
+
+        if (
+            message === ""
+            &&
+            sticker === ""
+        ) {
+
+            return res.status(400).json({
+
+                ok: false,
+
+                error:
+                    "Empty message"
+            });
+        }
+
+        //====================================================
+        // PROFILE
+        //====================================================
+
+        const profile =
+            getProfile(
+                userId,
+                username
+            );
+
+        const isOwner =
+            username.toLowerCase() ===
+            OWNER_USERNAME.toLowerCase();
+
+        //====================================================
+        // REPLY
+        //====================================================
+
+        let replyTo = null;
+
+        if (
+            req.body.replyTo
+        ) {
+
+            replyTo =
+                cleanReply(
+                    req.body.replyTo
+                );
+
+            if (
+                !replyTo
+            ) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "Reply message not found"
+                });
+            }
+        }
+
+        //====================================================
+        // CREATE MESSAGE
+        //====================================================
+
+        const newMessage = {
+
+            id:
+                createMessageId(),
+
+            userId,
+
+            username,
+
+            tag:
+                isOwner
+                    ? "Owner"
+                    : profile.tag,
+
+            color:
+                profile.color,
+
+            verified:
+                isOwner,
+
+            discordIcon:
+                profile.discordIcon || "",
+
+            message,
+
             sticker,
 
-        replyTo:
             replyTo,
 
-        discordImage:
-            DISCORD_IMAGE_ID,
+            timestamp:
+                Date.now()
+        };
 
-        timestamp:
-            Date.now()
-
-    };
-
-    messages.push(
-        newMessage
-    );
-
-    // Seguridad adicional de memoria.
-    while (
-        messages.length >
-        MAX_MESSAGES
-    ) {
-
-        messages.shift();
-
-    }
-
-    res.json({
-
-        ok: true,
-
-        message:
+        messages.push(
             newMessage
-
-    });
-
-});
-
-// ========================================================
-// AUTO CLEAN
-// ========================================================
-// Cada 7 minutos elimina exactamente 2 mensajes antiguos.
-// Si hay menos de 2, elimina los que existan.
-
-setInterval(() => {
-
-    const amount =
-        Math.min(
-            2,
-            messages.length
         );
 
-    for (
-        let i = 0;
-        i < amount;
-        i++
-    ) {
+        //====================================================
+        // HARD LIMIT
+        //====================================================
 
-        messages.shift();
+        while (
+            messages.length >
+            MAX_MESSAGES
+        ) {
 
+            const deleted =
+                messages.shift();
+
+            if (deleted) {
+
+                recentlyDeleted.push(
+                    deleted.id
+                );
+            }
+        }
+
+        while (
+            recentlyDeleted.length >
+            100
+        ) {
+
+            recentlyDeleted.shift();
+        }
+
+        res.json({
+
+            ok: true,
+
+            message:
+                newMessage
+        });
     }
+);
 
-    console.log(
-        "[Glodon] Limpieza automática:",
-        amount,
-        "mensajes eliminados."
-    );
-
-}, MESSAGE_CLEAN_INTERVAL);
-
-// ========================================================
-// PRESENCE CLEAN
-// ========================================================
-
-setInterval(() => {
-
-    removeOldPresence();
-
-}, 5000);
-
-// ========================================================
-// SERVER
-// ========================================================
+//============================================================
+// START
+//============================================================
 
 app.listen(
     PORT,
-    "0.0.0.0",
-    () => {
+    function() {
 
         console.log(
-            "======================================"
+            "=========================================="
         );
 
         console.log(
-            "Glodon Hub Global Chat"
+            "Glodon Hub | Global Chat"
         );
 
         console.log(
-            "Server online"
-        );
-
-        console.log(
-            "Port:",
+            "Server running on port " +
             PORT
         );
 
         console.log(
-            "Discord image:",
-            DISCORD_IMAGE_ID || "OFF"
+            "Auto delete: 2 messages / 7 minutes"
         );
 
         console.log(
-            "Auto clean: 2 messages / 7 minutes"
+            "Owner: " +
+            OWNER_USERNAME
         );
 
         console.log(
-            "======================================"
-
+            "=========================================="
         );
-
     }
 );
