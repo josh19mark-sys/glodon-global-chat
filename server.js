@@ -4,310 +4,496 @@ const cors = require("cors");
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "32kb" }));
+app.use(express.json({ limit: "64kb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// ==============================
-// CONFIGURACIÓN
-// ==============================
+const OWNER_USERNAME = "ueu9195";
 
-const PRESENCE_TIMEOUT = 20000;
-const MAX_MESSAGES = 250;
-const MAX_MESSAGE_LENGTH = 300;
-const MESSAGE_COOLDOWN = 700;
+const MAX_MESSAGES = 150;
+const PRESENCE_TIMEOUT = 18000;
+const MAX_COLOR_CHANGES = 2;
 
-// ==============================
-// DATOS DEL SERVIDOR
-// ==============================
+const BLOCKED_TAGS = new Set([
+  "admin",
+  "creator",
+  "67",
+  "xd",
+  "haa",
+  "verificado",
+  "desarrollador",
+  "mod",
+  "moderador"
+]);
 
 const users = new Map();
 const messages = [];
+const profiles = new Map();
 
-let nextMessageId = 1;
+function now() {
+  return Date.now();
+}
 
-// ==============================
-// LIMPIAR USUARIOS OFFLINE
-// ==============================
+function cleanText(value, maxLength) {
+  if (typeof value !== "string") return "";
 
-function cleanUsers() {
-    const now = Date.now();
+  return value
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .trim()
+    .slice(0, maxLength);
+}
 
-    for (const [userId, user] of users.entries()) {
-        if (now - user.lastSeen > PRESENCE_TIMEOUT) {
-            users.delete(userId);
-        }
+function cleanUsername(value) {
+  return cleanText(value, 32) || "Usuario";
+}
+
+function validUserId(value) {
+  if (typeof value !== "string") return false;
+
+  return (
+    value.length >= 1 &&
+    value.length <= 80 &&
+    /^[a-zA-Z0-9_.:-]+$/.test(value)
+  );
+}
+
+function validColor(value) {
+  if (typeof value !== "string") return false;
+
+  return /^#[0-9A-Fa-f]{6}$/.test(value);
+}
+
+function validSticker(value) {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+
+  if (typeof value !== "string") return "";
+
+  // Acepta:
+  // rbxassetid://123456
+  // https://www.roblox.com/asset/?id=123456
+  // https://create.roblox.com/asset/?id=123456
+  if (
+    /^rbxassetid:\/\/\d+$/.test(value) ||
+    /^https:\/\/www\.roblox\.com\/asset\/\?id=\d+$/.test(value) ||
+    /^https:\/\/create\.roblox\.com\/asset\/\?id=\d+$/.test(value)
+  ) {
+    return value;
+  }
+
+  return "";
+}
+
+function isBlockedTag(tag) {
+  if (!tag) return false;
+
+  return BLOCKED_TAGS.has(tag.toLowerCase());
+}
+
+function removeOldPresence() {
+  const limit = now() - PRESENCE_TIMEOUT;
+
+  for (const [userId, user] of users.entries()) {
+    if (user.lastSeen < limit) {
+      users.delete(userId);
     }
+  }
 }
 
-// ==============================
-// VALIDAR TEXTO
-// ==============================
+function isConnected(userId) {
+  removeOldPresence();
 
-function validText(value, maxLength) {
-    return (
-        typeof value === "string" &&
-        value.trim().length > 0 &&
-        value.length <= maxLength
-    );
+  const user = users.get(userId);
+
+  if (!user) return false;
+
+  return now() - user.lastSeen <= PRESENCE_TIMEOUT;
 }
 
-// ==============================
-// INICIO
-// ==============================
+function publicProfile(userId, username) {
+  const existing = profiles.get(userId);
+
+  const safeUsername = cleanUsername(username);
+
+  if (!existing) {
+    return {
+      userId,
+      username: safeUsername,
+      tag: "",
+      color: "#FFFFFF",
+      colorChanges: 0,
+      verified: safeUsername.toLowerCase() === OWNER_USERNAME.toLowerCase()
+    };
+  }
+
+  return {
+    userId,
+    username: existing.username,
+    tag: existing.tag,
+    color: existing.color,
+    colorChanges: existing.colorChanges,
+    verified: existing.verified
+  };
+}
+
+/* =========================
+   HOME / HEALTH
+========================= */
 
 app.get("/", (req, res) => {
-    res.json({
-        ok: true,
-        service: "Glodon Hub Global Chat",
-        status: "online"
-    });
+  res.json({
+    ok: true,
+    service: "Glodon Hub Global Chat",
+    status: "online",
+    version: "2.0.0"
+  });
 });
-
-// ==============================
-// HEALTH CHECK
-// ==============================
 
 app.get("/health", (req, res) => {
-    res.json({
-        ok: true,
-        status: "online"
-    });
+  removeOldPresence();
+
+  res.json({
+    ok: true,
+    status: "online",
+    users: users.size,
+    messages: messages.length,
+    timestamp: now()
+  });
 });
 
-// ==============================
-// PRESENCIA
-// ==============================
+/* =========================
+   PRESENCE
+========================= */
 
 app.get("/presence", (req, res) => {
+  removeOldPresence();
 
-    cleanUsers();
-
-    res.json({
-        ok: true,
-        online: users.size
-    });
+  res.json({
+    ok: true,
+    online: users.size,
+    timestamp: now()
+  });
 });
-
-// ==============================
-// HEARTBEAT
-// ==============================
 
 app.post("/heartbeat", (req, res) => {
+  const userId = cleanText(req.body?.userId, 80);
+  const username = cleanUsername(req.body?.username);
 
-    cleanUsers();
-
-    const {
-        userId,
-        username,
-        avatar
-    } = req.body || {};
-
-    if (!validText(String(userId || ""), 100)) {
-        return res.status(400).json({
-            ok: false,
-            error: "Invalid userId"
-        });
-    }
-
-    const id = String(userId);
-
-    const existing = users.get(id);
-
-    users.set(id, {
-        userId: id,
-
-        username:
-            validText(username, 40)
-                ? username.trim()
-                : "Usuario",
-
-        avatar:
-            validText(avatar, 500)
-                ? avatar
-                : "",
-
-        lastSeen: Date.now(),
-
-        lastMessage:
-            existing?.lastMessage || 0
+  if (!validUserId(userId)) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid userId"
     });
+  }
 
-    res.json({
-        ok: true,
-        online: users.size
+  users.set(userId, {
+    userId,
+    username,
+    lastSeen: now()
+  });
+
+  // Crear perfil automáticamente
+  if (!profiles.has(userId)) {
+    profiles.set(userId, {
+      userId,
+      username,
+      tag: "",
+      color: "#FFFFFF",
+      colorChanges: 0,
+      verified:
+        username.toLowerCase() === OWNER_USERNAME.toLowerCase()
     });
+  } else {
+    const profile = profiles.get(userId);
+
+    profile.username = username;
+
+    // La verificación del propietario se mantiene basada
+    // en el nombre recibido.
+    profile.verified =
+      username.toLowerCase() === OWNER_USERNAME.toLowerCase();
+  }
+
+  res.json({
+    ok: true,
+    online: users.size,
+    profile: publicProfile(userId, username)
+  });
 });
-
-// ==============================
-// SALIR DEL CHAT
-// ==============================
 
 app.post("/leave", (req, res) => {
+  const userId = cleanText(req.body?.userId, 80);
 
-    const {
-        userId
-    } = req.body || {};
+  if (userId) {
+    users.delete(userId);
+  }
 
-    if (userId !== undefined && userId !== null) {
-        users.delete(String(userId));
-    }
-
-    res.json({
-        ok: true
-    });
+  res.json({
+    ok: true,
+    online: users.size
+  });
 });
 
-// ==============================
-// OBTENER MENSAJES
-// ==============================
+/* =========================
+   PROFILES
+========================= */
 
-app.get("/messages", (req, res) => {
+app.get("/profile/:userId", (req, res) => {
+  const userId = cleanText(req.params.userId, 80);
 
-    const requestedLimit =
-        parseInt(req.query.limit, 10) || 50;
-
-    const limit = Math.min(
-        Math.max(requestedLimit, 1),
-        50
-    );
-
-    const result = messages.slice(-limit);
-
-    res.json({
-        ok: true,
-        messages: result
+  if (!validUserId(userId)) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid userId"
     });
+  }
+
+  const user = users.get(userId);
+
+  const username =
+    user?.username ||
+    profiles.get(userId)?.username ||
+    "Usuario";
+
+  res.json({
+    ok: true,
+    profile: publicProfile(userId, username)
+  });
 });
 
-// ==============================
-// ENVIAR MENSAJE
-// ==============================
+app.post("/profile", (req, res) => {
+  const userId = cleanText(req.body?.userId, 80);
+  const username = cleanUsername(req.body?.username);
 
-app.post("/messages", (req, res) => {
+  if (!validUserId(userId)) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid userId"
+    });
+  }
 
-    cleanUsers();
+  if (!isConnected(userId)) {
+    return res.status(403).json({
+      ok: false,
+      error: "Not connected"
+    });
+  }
 
-    const {
-        userId,
-        username,
-        avatar,
-        color,
-        tag,
-        message
-    } = req.body || {};
+  let profile = profiles.get(userId);
 
-    if (!validText(String(userId || ""), 100)) {
-        return res.status(400).json({
-            ok: false,
-            error: "Invalid userId"
-        });
-    }
-
-    if (!validText(username, 40)) {
-        return res.status(400).json({
-            ok: false,
-            error: "Invalid username"
-        });
-    }
-
-    if (!validText(message, MAX_MESSAGE_LENGTH)) {
-        return res.status(400).json({
-            ok: false,
-            error: "Invalid message"
-        });
-    }
-
-    const id = String(userId);
-
-    // Solo usuarios conectados pueden escribir
-    if (!users.has(id)) {
-        return res.status(403).json({
-            ok: false,
-            error: "Not connected"
-        });
-    }
-
-    // Anti-spam
-    const now = Date.now();
-
-    const user = users.get(id);
-
-    const previousMessage =
-        user.lastMessage || 0;
-
-    if (now - previousMessage < MESSAGE_COOLDOWN) {
-        return res.status(429).json({
-            ok: false,
-            error: "Too fast"
-        });
-    }
-
-    user.lastMessage = now;
-
-    // Crear mensaje
-    const newMessage = {
-        id: nextMessageId++,
-
-        userId: id,
-
-        username: username.trim(),
-
-        avatar:
-            validText(avatar, 500)
-                ? avatar
-                : "",
-
-        color:
-            validText(color, 30)
-                ? color
-                : "FFFFFF",
-
-        tag:
-            validText(tag, 50)
-                ? tag
-                : "",
-
-        message: message.trim(),
-
-        timestamp: now
+  if (!profile) {
+    profile = {
+      userId,
+      username,
+      tag: "",
+      color: "#FFFFFF",
+      colorChanges: 0,
+      verified:
+        username.toLowerCase() === OWNER_USERNAME.toLowerCase()
     };
 
-    messages.push(newMessage);
+    profiles.set(userId, profile);
+  }
 
-    // Mantener solamente los últimos mensajes
-    while (messages.length > MAX_MESSAGES) {
-        messages.shift();
+  profile.username = username;
+
+  const isOwner =
+    username.toLowerCase() === OWNER_USERNAME.toLowerCase();
+
+  profile.verified = isOwner;
+
+  /* ---------- TAG ---------- */
+
+  if (Object.prototype.hasOwnProperty.call(req.body, "tag")) {
+    const requestedTag = cleanText(req.body.tag, 24);
+
+    // El propietario puede usar su tag personalizado.
+    if (isOwner) {
+      profile.tag = requestedTag;
+    } else {
+      // Usuarios normales no pueden usar tags bloqueados.
+      if (isBlockedTag(requestedTag)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Blocked tag"
+        });
+      }
+
+      profile.tag = requestedTag;
+    }
+  }
+
+  /* ---------- COLOR ---------- */
+
+  if (Object.prototype.hasOwnProperty.call(req.body, "color")) {
+    const requestedColor = req.body.color;
+
+    if (!validColor(requestedColor)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid color"
+      });
     }
 
-    res.json({
-        ok: true,
-        message: newMessage
-    });
+    if (requestedColor !== profile.color) {
+      if (profile.colorChanges >= MAX_COLOR_CHANGES) {
+        return res.status(403).json({
+          ok: false,
+          error: "Color change limit reached",
+          limit: MAX_COLOR_CHANGES
+        });
+      }
+
+      profile.color = requestedColor;
+      profile.colorChanges++;
+    }
+  }
+
+  profiles.set(userId, profile);
+
+  res.json({
+    ok: true,
+    profile: publicProfile(userId, username)
+  });
 });
 
-// ==============================
-// ERROR DEL SERVIDOR
-// ==============================
+/* =========================
+   MESSAGES
+========================= */
+
+app.get("/messages", (req, res) => {
+  const requestedLimit = Number.parseInt(req.query.limit, 10);
+
+  const limit =
+    Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 50)
+      : 50;
+
+  const result = messages.slice(-limit);
+
+  res.json({
+    ok: true,
+    messages: result
+  });
+});
+
+app.post("/messages", (req, res) => {
+  const userId = cleanText(req.body?.userId, 80);
+  const username = cleanUsername(req.body?.username);
+
+  if (!validUserId(userId)) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid userId"
+    });
+  }
+
+  if (!isConnected(userId)) {
+    return res.status(403).json({
+      ok: false,
+      error: "Not connected"
+    });
+  }
+
+  const messageText = cleanText(req.body?.message, 500);
+  const sticker = validSticker(req.body?.sticker);
+
+  if (!messageText && !sticker) {
+    return res.status(400).json({
+      ok: false,
+      error: "Empty message"
+    });
+  }
+
+  let profile = profiles.get(userId);
+
+  if (!profile) {
+    profile = {
+      userId,
+      username,
+      tag: "",
+      color: "#FFFFFF",
+      colorChanges: 0,
+      verified:
+        username.toLowerCase() === OWNER_USERNAME.toLowerCase()
+    };
+
+    profiles.set(userId, profile);
+  }
+
+  profile.username = username;
+
+  const isOwner =
+    username.toLowerCase() === OWNER_USERNAME.toLowerCase();
+
+  profile.verified = isOwner;
+
+  const message = {
+    id:
+      `${Date.now()}-` +
+      Math.random().toString(36).slice(2, 10),
+
+    userId,
+
+    username: profile.username,
+
+    tag: profile.tag,
+
+    color: profile.color,
+
+    verified: profile.verified,
+
+    message: messageText,
+
+    sticker,
+
+    timestamp: now()
+  };
+
+  messages.push(message);
+
+  // Máximo 150 mensajes en memoria.
+  while (messages.length > MAX_MESSAGES) {
+    messages.shift();
+  }
+
+  res.json({
+    ok: true,
+    message
+  });
+});
+
+/* =========================
+   404
+========================= */
+
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: "Route not found"
+  });
+});
+
+/* =========================
+   ERROR HANDLER
+========================= */
 
 app.use((err, req, res, next) => {
+  console.error(err);
 
-    console.error(err);
-
-    res.status(500).json({
-        ok: false,
-        error: "Internal server error"
-    });
+  res.status(500).json({
+    ok: false,
+    error: "Internal server error"
+  });
 });
 
-// ==============================
-// INICIAR SERVIDOR
-// ==============================
+/* =========================
+   START
+========================= */
 
 app.listen(PORT, "0.0.0.0", () => {
-
-    console.log(
-        "Glodon Hub Global Chat running on port " + PORT
-    );
-
+  console.log(
+    `Glodon Hub Global Chat running on port ${PORT}`
+  );
 });
